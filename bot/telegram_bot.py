@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -64,12 +65,50 @@ class LabTelegramBot:
         BotCommand("reset", "إعادة ضبط المختبر"),
     ]
 
-    def __init__(self, client: LabClient, fixture_password: str = "lab-only-password"):
+    def __init__(
+        self,
+        client: LabClient,
+        fixture_password: str = "lab-only-password",
+        state_path: Path | None = None,
+    ):
         if not fixture_password:
             raise ValueError("The synthetic fixture password must not be empty")
         self.client = client
         self.fixture_password = fixture_password
+        self.state_path = state_path
         self._sessions: dict[int, dict[str, str]] = {}
+        self._load_sessions()
+
+    def _load_sessions(self) -> None:
+        if self.state_path is None:
+            return
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("session state must be an object")
+            sessions: dict[int, dict[str, str]] = {}
+            for raw_user_id, record in raw.items():
+                if not isinstance(record, dict):
+                    raise ValueError("invalid session record")
+                user_id = int(raw_user_id)
+                values = {key: record[key] for key in ("token", "account", "expires_at")}
+                if not all(isinstance(value, str) and value for value in values.values()):
+                    raise ValueError("invalid session values")
+                sessions[user_id] = values
+            self._sessions = sessions
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring invalid synthetic Telegram session state: %s", exc)
+
+    def _save_sessions(self) -> None:
+        if self.state_path is None:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        payload = {str(user_id): record for user_id, record in self._sessions.items()}
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(self.state_path)
 
     async def _authorized(self, update: Update) -> bool:
         if update.effective_user is not None:
@@ -154,6 +193,7 @@ class LabTelegramBot:
                 "account": result["account"],
                 "expires_at": result["expires_at"],
             }
+            self._save_sessions()
             return {
                 "status": "synthetic_session_created",
                 "account": result["account"],
@@ -184,6 +224,7 @@ class LabTelegramBot:
         async def revoke(token: str) -> dict[str, str]:
             await self.client.delete("/v1/auth/sessions", session_token=token)
             self._sessions.pop(user_id, None)
+            self._save_sessions()
             return {"status": "synthetic_session_revoked"}
 
         await self._execute_with_session(update, revoke)
@@ -317,6 +358,7 @@ class LabTelegramBot:
         async def reset_lab() -> dict[str, Any]:
             result = await self.client.post("/v1/lab/reset", {})
             self._sessions.clear()
+            self._save_sessions()
             return result
 
         await self._execute(update, reset_lab)
@@ -331,7 +373,12 @@ def run_bot() -> None:
         os.environ.get("LAB_API_URL", f"http://127.0.0.1:{port}"),
         os.environ.get("LAB_ADMIN_KEY", ""),
     )
-    bot = LabTelegramBot(client, os.environ.get("LAB_FIXTURE_PASSWORD", "lab-only-password"))
+    data_dir = Path(os.environ.get("LAB_DATA_DIR", ".lab-data"))
+    bot = LabTelegramBot(
+        client,
+        os.environ.get("LAB_FIXTURE_PASSWORD", "lab-only-password"),
+        state_path=data_dir / "telegram-sessions.json",
+    )
 
     async def configure_commands(application: Application) -> None:
         await application.bot.set_my_commands(bot.COMMANDS)
@@ -370,4 +417,5 @@ def run_bot() -> None:
     }.items():
         application.add_handler(CommandHandler(command, handler))
     application.add_error_handler(on_error)
-    application.run_polling(allowed_updates=["message"], drop_pending_updates=True)
+    # Keep Telegram's unconfirmed updates queued during the short restart gap.
+    application.run_polling(allowed_updates=["message"], drop_pending_updates=False)
