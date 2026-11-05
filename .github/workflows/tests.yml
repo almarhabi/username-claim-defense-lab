@@ -22,41 +22,65 @@ jobs:
       - name: Install dependencies
         run: pip install -r dev-requirements.txt
       - name: Compile application
-        run: python -m compileall -q app bot tests
+        run: python -m compileall -q app bot tests launcher.py
       - name: Static checks
-        run: ruff check app bot tests
+        run: ruff check app bot tests launcher.py
       - name: Run tests
         run: python -m pytest
 
-  container-integration:
+  api-integration:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      LAB_ADMIN_KEY: integration-only-admin-key
+      LAB_DATA_DIR: ${{ runner.temp }}/synthetic-lab-data
     steps:
       - uses: actions/checkout@v4
-      - name: Validate Compose configuration
-        run: docker compose config --quiet
-      - name: Build and start synthetic service
-        run: docker compose up -d --build social
-      - name: Verify container health and isolation marker
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Start Python API without Docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > "$RUNNER_TEMP/lab-api.log" 2>&1 &
+          echo "LAB_PID=$!" >> "$GITHUB_ENV"
+      - name: Verify health and isolation marker
         shell: bash
         run: |
           set -euo pipefail
           healthy=false
           for _ in {1..45}; do
-            if curl --silent --fail http://127.0.0.1:8000/health > /tmp/lab-health.json; then
+            if curl --silent --fail http://127.0.0.1:8000/health > "$RUNNER_TEMP/lab-health.json"; then
               healthy=true
               break
             fi
-            sleep 2
+            sleep 1
           done
           if [[ "$healthy" != true ]]; then
-            docker compose logs social
+            cat "$RUNNER_TEMP/lab-api.log"
             exit 1
           fi
-          python -c 'import json; data=json.load(open("/tmp/lab-health.json")); assert data == {"status": "ok", "lab_only": True, "domain": "social.lab.internal"}'
-      - name: Show logs after a failure
+          python - <<'PY'
+          import json
+          import os
+
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "lab-health.json"), encoding="utf-8") as handle:
+              data = json.load(handle)
+          assert data == {"status": "ok", "lab_only": True, "domain": "social.lab.internal"}
+          print("Synthetic API health check passed")
+          PY
+      - name: Show API logs after a failure
         if: failure()
-        run: docker compose logs --tail=100
-      - name: Remove ephemeral containers and data
+        run: cat "$RUNNER_TEMP/lab-api.log"
+      - name: Stop ephemeral API
         if: always()
-        run: docker compose down --volumes --remove-orphans
+        shell: bash
+        run: |
+          if [[ -n "${LAB_PID:-}" ]]; then
+            kill "$LAB_PID" 2>/dev/null || true
+            wait "$LAB_PID" 2>/dev/null || true
+          fi
