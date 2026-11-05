@@ -74,8 +74,10 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          set +e
           python -m pytest -vv --tb=short 2>&1 | tee pytest-output.txt
           result=${PIPESTATUS[0]}
+          set -e
           if [[ "$result" -ne 0 ]]; then
             python - <<'PY'
           from pathlib import Path
