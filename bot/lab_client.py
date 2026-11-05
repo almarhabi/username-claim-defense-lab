@@ -32,18 +32,48 @@ class LabClient:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"), timeout=30, follow_redirects=False
         )
-        self._headers = {"X-Lab-Key": admin_key}
+        self._admin_headers = {"X-Lab-Key": admin_key}
+
+    @staticmethod
+    def _session_headers(session_token: str) -> dict[str, str]:
+        if not session_token:
+            raise ValueError("A synthetic session token is required")
+        return {"Authorization": f"Bearer {session_token}"}
 
     async def get(self, path: str, admin: bool = False) -> Any:
-        response = await self._client.get(path, headers=self._headers if admin else None)
+        response = await self._client.get(
+            path, headers=self._admin_headers if admin else None
+        )
         response.raise_for_status()
         return response.json()
 
-    async def post(self, path: str, payload: dict[str, Any], admin: bool = True) -> Any:
-        response = await self._client.post(
-            path, json=payload, headers=self._headers if admin else None
+    async def post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        admin: bool = True,
+        session_token: str = "",
+    ) -> Any:
+        if admin and session_token:
+            raise ValueError("Choose either admin or synthetic session authentication")
+        headers = (
+            self._admin_headers
+            if admin
+            else self._session_headers(session_token)
+            if session_token
+            else None
+        )
+        response = await self._client.post(path, json=payload, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    async def delete(self, path: str, session_token: str) -> Any:
+        response = await self._client.delete(
+            path, headers=self._session_headers(session_token)
         )
         response.raise_for_status()
+        if response.status_code == 204 or not response.content:
+            return {"status": "ok"}
         return response.json()
 
     async def close(self) -> None:
