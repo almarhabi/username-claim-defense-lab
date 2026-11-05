@@ -1,31 +1,41 @@
-name: telegram-runtime-check
+name: Telegram lab bot 24h
 
+# Each hosted job stops before GitHub's six-hour limit. A successful long run
+# dispatches its replacement; the schedule is a fallback after an early crash.
 on:
   workflow_dispatch:
-    inputs:
-      minutes:
-        description: Temporary polling duration in minutes (1-330), not permanent hosting
-        required: true
-        default: "5"
-        type: string
+  schedule:
+    - cron: "*/30 * * * *"
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "bot/**"
+      - "tests/**"
+      - "launcher.py"
+      - "requirements.txt"
+      - ".github/workflows/lab-controller.yml"
+
+# Telegram permits only one polling consumer per bot token. A replacement run
+# queues behind the current run; a code push replaces the older running version.
+concurrency:
+  group: synthetic-telegram-lab
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 permissions:
   contents: read
-
-concurrency:
-  group: synthetic-telegram-polling
-  cancel-in-progress: false
+  actions: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
     env:
-      RUN_MINUTES: ${{ inputs.minutes }}
       LAB_ADMIN_KEY: ${{ secrets.LAB_ADMIN_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       LAB_FIXTURE_PASSWORD: lab-only-password
-      LAB_DATA_DIR: ${{ runner.temp }}/synthetic-lab-data
+      LAB_DATA_DIR: .lab-data
+      LAB_SESSION_TTL_SECONDS: "604800"
     steps:
       - uses: actions/checkout@v4
 
@@ -34,17 +44,10 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
       - name: Validate runtime configuration
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$RUN_MINUTES" =~ ^[0-9]+$ ]] || (( RUN_MINUTES < 1 || RUN_MINUTES > 330 )); then
-            echo "::error::minutes must be an integer from 1 through 330"
-            exit 1
-          fi
           for variable in LAB_ADMIN_KEY TELEGRAM_BOT_TOKEN; do
             if [[ -z "${!variable}" ]]; then
               echo "::error::$variable must be configured in Actions secrets"
@@ -55,6 +58,9 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
 
       - name: Verify Telegram authentication
         shell: bash
@@ -74,19 +80,73 @@ jobs:
           asyncio.run(verify())
           PY
 
-      - name: Run Telegram polling for the requested temporary window
+      - name: Prepare persistent lab directory
+        run: mkdir -p .lab-data
+
+      - name: Restore synthetic lab state
+        uses: actions/cache/restore@v4
+        with:
+          path: .lab-data
+          key: lab-data-${{ github.run_id }}
+          restore-keys: lab-data-
+
+      - name: Run bot and lab API
+        id: bot
+        continue-on-error: true
         shell: bash
         run: |
           set -uo pipefail
-          timeout --signal=SIGINT --kill-after=20s "${RUN_MINUTES}m" python launcher.py
+          start=$(date +%s)
+          timeout --signal=SIGINT --kill-after=20s 340m python launcher.py
           result=$?
-          if [[ "$result" -eq 124 ]]; then
-            echo "The temporary polling window completed; the runner will now stop."
+          elapsed=$(( $(date +%s) - start ))
+
+          if [[ "$result" -eq 124 && "$elapsed" -ge 19800 ]]; then
+            echo "restart=true" >> "$GITHUB_OUTPUT"
+            echo "Planned restart window reached; synthetic state will be saved."
             exit 0
           fi
+
+          echo "::error::Bot exited before the planned restart window (status=$result, elapsed=${elapsed}s)"
+          echo "The 30-minute schedule will retry after an early failure."
           if [[ "$result" -eq 0 ]]; then
-            echo "::error::The bot stopped before the requested polling window ended"
             exit 1
           fi
-          echo "::error::The bot exited unexpectedly with status $result"
           exit "$result"
+
+      - name: Save synthetic lab state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .lab-data
+          key: lab-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Remove superseded state snapshots
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: lab-data-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          keys=$(gh cache list --key lab-data- --limit 100 --json key --jq '.[].key')
+          if ! grep -qx "$KEEP" <<< "$keys"; then
+            echo "No new state snapshot was saved; retaining the previous snapshot."
+            exit 0
+          fi
+          while IFS= read -r key; do
+            if [[ -n "$key" && "$key" != "$KEEP" ]]; then
+              gh cache delete "$key" || true
+            fi
+          done <<< "$keys"
+
+      - name: Dispatch replacement run
+        if: steps.bot.outputs.restart == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run lab-controller.yml --ref "${{ github.ref_name }}"
+
+      - name: Preserve an early failure as a failed run
+        if: steps.bot.outcome == 'failure'
+        run: exit 1
