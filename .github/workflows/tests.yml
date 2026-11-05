@@ -12,6 +12,7 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,5 +23,40 @@ jobs:
         run: pip install -r dev-requirements.txt
       - name: Compile application
         run: python -m compileall -q app bot tests
+      - name: Static checks
+        run: ruff check app bot tests
       - name: Run tests
         run: python -m pytest
+
+  container-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build and start synthetic service
+        run: docker compose up -d --build social
+      - name: Verify container health and isolation marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          healthy=false
+          for _ in {1..45}; do
+            if curl --silent --fail http://127.0.0.1:8000/health > /tmp/lab-health.json; then
+              healthy=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$healthy" != true ]]; then
+            docker compose logs social
+            exit 1
+          fi
+          python -c 'import json; data=json.load(open("/tmp/lab-health.json")); assert data == {"status": "ok", "lab_only": True, "domain": "social.lab.internal"}'
+      - name: Show logs after a failure
+        if: failure()
+        run: docker compose logs --tail=100
+      - name: Remove ephemeral containers and data
+        if: always()
+        run: docker compose down --volumes --remove-orphans
