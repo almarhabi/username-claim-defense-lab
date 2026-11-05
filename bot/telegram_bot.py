@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from .lab_client import LabClient
@@ -16,7 +16,11 @@ logger = logging.getLogger(__name__)
 
 
 class LabTelegramBot:
-    """Allow-listed Telegram commands for the synthetic service only."""
+    """Telegram controller for the synthetic service only.
+
+    Access is intentionally unrestricted. Anyone who can find the bot can operate
+    the lab, including resetting it. Sessions remain isolated by Telegram user ID.
+    """
 
     HELP = (
         "مختبر أسماء المستخدمين الاصطناعية\n\n"
@@ -25,9 +29,9 @@ class LabTelegramBot:
         "/names — الأسماء ومالكوها\n"
         "/accounts — الحسابات الاصطناعية\n\n"
         "جلسة المختبر الخاصة بك:\n"
-        "/session ACCOUNT — إنشاء جلسة اصطناعية دون إرسال كلمة مرور\n"
-        "/whoami — الحساب المرتبط بجلسة البوت\n"
-        "/logout — إبطال الجلسة وحذفها من ذاكرة البوت\n"
+        "/session ACCOUNT — إنشاء جلسة اصطناعية\n"
+        "/whoami — الحساب المرتبط بجلستك\n"
+        "/logout — إبطال الجلسة\n"
         "/claim NAME — التقاط اسم باستخدام جلستك\n"
         "/release NAME — تحرير اسم تملكه جلستك\n"
         "/mytransfer NAME TARGET — نقل اسم تملكه جلستك\n\n"
@@ -35,34 +39,43 @@ class LabTelegramBot:
         "/race NAME [2-16] — تجربة سباق الالتقاط\n"
         "/burst ACCOUNT REQUESTS [NAME] — تجربة محدد الطلبات\n"
         "/transfer NAME SOURCE TARGET — نقل إداري داخل المختبر\n"
-        "/defenses on|off — تشغيل الدفاعات أو تعطيلها للمقارنة\n"
+        "/defenses on|off — تشغيل الدفاعات أو تعطيلها\n"
         "/audit [1-100] — آخر أحداث التدقيق\n"
         "/reset CONFIRM — إعادة جميع بيانات المختبر\n\n"
-        "كل البيانات والجلسات اصطناعية. لا تُدخل بيانات أي خدمة خارجية."
+        "كل البيانات اصطناعية. البوت مفتوح لكل مستخدمي Telegram."
     )
 
-    def __init__(
-        self,
-        client: LabClient,
-        allowed_users: set[int],
-        fixture_password: str = "lab-only-password",
-    ):
-        if not allowed_users:
-            raise ValueError("At least one Telegram user ID must be allow-listed")
+    COMMANDS = [
+        BotCommand("help", "عرض الأوامر"),
+        BotCommand("status", "حالة المختبر"),
+        BotCommand("names", "عرض الأسماء"),
+        BotCommand("accounts", "عرض الحسابات الاصطناعية"),
+        BotCommand("session", "إنشاء جلسة اصطناعية"),
+        BotCommand("whoami", "عرض الجلسة الحالية"),
+        BotCommand("logout", "إبطال الجلسة"),
+        BotCommand("claim", "التقاط اسم"),
+        BotCommand("release", "تحرير اسم"),
+        BotCommand("mytransfer", "نقل اسم باستخدام الجلسة"),
+        BotCommand("race", "تشغيل سباق التقاط"),
+        BotCommand("burst", "تشغيل اختبار معدل الطلبات"),
+        BotCommand("transfer", "نقل إداري داخل المختبر"),
+        BotCommand("defenses", "تغيير حالة الدفاعات"),
+        BotCommand("audit", "عرض سجل التدقيق"),
+        BotCommand("reset", "إعادة ضبط المختبر"),
+    ]
+
+    def __init__(self, client: LabClient, fixture_password: str = "lab-only-password"):
         if not fixture_password:
             raise ValueError("The synthetic fixture password must not be empty")
         self.client = client
-        self.allowed_users = allowed_users
         self.fixture_password = fixture_password
-        # In-memory only: sessions disappear on restart and are never sent to Telegram.
         self._sessions: dict[int, dict[str, str]] = {}
 
     async def _authorized(self, update: Update) -> bool:
-        user = update.effective_user
-        if user is not None and user.id in self.allowed_users:
+        if update.effective_user is not None:
             return True
         if update.effective_message:
-            await update.effective_message.reply_text("هذا المستخدم غير مصرح له بإدارة المختبر.")
+            await update.effective_message.reply_text("تعذر تحديد مستخدم Telegram.")
         return False
 
     @staticmethod
@@ -141,7 +154,6 @@ class LabTelegramBot:
                 "account": result["account"],
                 "expires_at": result["expires_at"],
             }
-            # Deliberately exclude session_token from the Telegram response.
             return {
                 "status": "synthetic_session_created",
                 "account": result["account"],
@@ -153,8 +165,7 @@ class LabTelegramBot:
     async def whoami(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
             return
-        user_id = update.effective_user.id
-        record = self._sessions.get(user_id)
+        record = self._sessions.get(update.effective_user.id)
         if record is None:
             result = {"synthetic_session": False}
         else:
@@ -178,9 +189,10 @@ class LabTelegramBot:
         await self._execute_with_session(update, revoke)
 
     async def claim(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._authorized(update) or len(context.args) != 1:
-            if update.effective_message and update.effective_user.id in self.allowed_users:
-                await self._send_json(update, {"usage": "/claim NAME"})
+        if not await self._authorized(update):
+            return
+        if len(context.args) != 1:
+            await self._send_json(update, {"usage": "/claim NAME"})
             return
         name = context.args[0]
         await self._execute_with_session(
@@ -191,9 +203,10 @@ class LabTelegramBot:
         )
 
     async def release(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._authorized(update) or len(context.args) != 1:
-            if update.effective_message and update.effective_user.id in self.allowed_users:
-                await self._send_json(update, {"usage": "/release NAME"})
+        if not await self._authorized(update):
+            return
+        if len(context.args) != 1:
+            await self._send_json(update, {"usage": "/release NAME"})
             return
         name = context.args[0]
         await self._execute_with_session(
@@ -204,9 +217,10 @@ class LabTelegramBot:
         )
 
     async def mytransfer(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._authorized(update) or len(context.args) != 2:
-            if update.effective_message and update.effective_user.id in self.allowed_users:
-                await self._send_json(update, {"usage": "/mytransfer NAME TARGET"})
+        if not await self._authorized(update):
+            return
+        if len(context.args) != 2:
+            await self._send_json(update, {"usage": "/mytransfer NAME TARGET"})
             return
         name, target = context.args
         await self._execute_with_session(
@@ -308,34 +322,33 @@ class LabTelegramBot:
         await self._execute(update, reset_lab)
 
 
-def parse_allowed_users(raw: str) -> set[int]:
-    try:
-        users = {int(value.strip()) for value in raw.split(",") if value.strip()}
-    except ValueError as exc:
-        raise ValueError("TELEGRAM_ALLOWED_USERS must be comma-separated numeric user IDs") from exc
-    if not users or any(user <= 0 for user in users):
-        raise ValueError("TELEGRAM_ALLOWED_USERS must contain positive Telegram user IDs")
-    return users
-
-
 def run_bot() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+    port = int(os.environ.get("PORT", "8000"))
     client = LabClient(
-        os.environ.get("LAB_API_URL", "http://social:8000"),
+        os.environ.get("LAB_API_URL", f"http://127.0.0.1:{port}"),
         os.environ.get("LAB_ADMIN_KEY", ""),
     )
-    bot = LabTelegramBot(
-        client,
-        parse_allowed_users(os.environ.get("TELEGRAM_ALLOWED_USERS", "")),
-        os.environ.get("LAB_FIXTURE_PASSWORD", "lab-only-password"),
-    )
+    bot = LabTelegramBot(client, os.environ.get("LAB_FIXTURE_PASSWORD", "lab-only-password"))
+
+    async def configure_commands(application: Application) -> None:
+        await application.bot.set_my_commands(bot.COMMANDS)
 
     async def close_client(_: Application) -> None:
         await client.close()
 
-    application = Application.builder().token(token).post_shutdown(close_client).build()
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Telegram handler failed for update %s", update, exc_info=context.error)
+
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(configure_commands)
+        .post_shutdown(close_client)
+        .build()
+    )
     for command, handler in {
         "start": bot.help,
         "help": bot.help,
@@ -356,4 +369,5 @@ def run_bot() -> None:
         "reset": bot.reset,
     }.items():
         application.add_handler(CommandHandler(command, handler))
+    application.add_error_handler(on_error)
     application.run_polling(allowed_updates=["message"], drop_pending_updates=True)
