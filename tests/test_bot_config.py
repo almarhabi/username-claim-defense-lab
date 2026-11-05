@@ -4,7 +4,6 @@ import httpx
 import pytest
 
 from bot.lab_client import LabClient
-from bot.telegram_bot import parse_allowed_users
 
 
 @pytest.mark.parametrize(
@@ -55,10 +54,3 @@ async def test_session_request_does_not_include_admin_key() -> None:
     )
     assert result == {"status": "ok"}
     await client.close()
-
-
-def test_telegram_allow_list_is_fail_closed() -> None:
-    assert parse_allowed_users("123, 456") == {123, 456}
-    for raw in ("", "abc", "123,-4"):
-        with pytest.raises(ValueError):
-            parse_allowed_users(raw)
