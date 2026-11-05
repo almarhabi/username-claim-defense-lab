@@ -64,11 +64,14 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r dev-requirements.txt
 
-      - name: Compile and test before starting polling
-        run: |
-          python -m compileall -q app bot tests launcher.py telegram_preflight.py
-          ruff check app bot tests launcher.py telegram_preflight.py
-          python -m pytest
+      - name: Compile Python sources
+        run: python -m compileall -q app bot tests launcher.py telegram_preflight.py
+
+      - name: Run Ruff
+        run: ruff check app bot tests launcher.py telegram_preflight.py
+
+      - name: Run unit tests
+        run: python -m pytest -vv
 
       - name: Verify Telegram authentication and polling availability
         run: python telegram_preflight.py
