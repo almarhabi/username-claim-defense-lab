@@ -1,0 +1,128 @@
+name: synthetic-lab-controller
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Control the persistent containers on this self-hosted runner
+        required: true
+        default: up
+        type: choice
+        options:
+          - up
+          - restart
+          - status
+          - down
+
+permissions:
+  contents: read
+
+concurrency:
+  group: synthetic-lab-controller
+  cancel-in-progress: false
+
+jobs:
+  control:
+    # Deliberately self-hosted: GitHub-hosted runners are not persistent hosting.
+    runs-on: self-hosted
+    timeout-minutes: 15
+    env:
+      ACTION: ${{ inputs.action }}
+      LAB_ADMIN_KEY: ${{ secrets.LAB_ADMIN_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_ALLOWED_USERS }}
+      COMPOSE_PROJECT_NAME: username-claim-defense-lab
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate runner and secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ runner.environment }}" = "self-hosted"
+          for variable in LAB_ADMIN_KEY TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS; do
+            if [[ -z "${!variable}" ]]; then
+              echo "::error::$variable must be configured in Actions secrets"
+              exit 1
+            fi
+            if [[ "${!variable}" == *$'\n'* || "${!variable}" == *$'\r'* ]]; then
+              echo "::error::$variable must be a single-line value"
+              exit 1
+            fi
+          done
+          if [[ ! "$TELEGRAM_ALLOWED_USERS" =~ ^[0-9]+(,[[:space:]]*[0-9]+)*$ ]]; then
+            echo "::error::TELEGRAM_ALLOWED_USERS must contain comma-separated numeric IDs"
+            exit 1
+          fi
+          docker compose version
+
+      - name: Create protected runtime environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          runtime_dir="$RUNNER_TEMP/synthetic-lab-runtime"
+          mkdir -p "$runtime_dir"
+          chmod 700 "$runtime_dir"
+          {
+            printf 'LAB_ADMIN_KEY=%s\n' "$LAB_ADMIN_KEY"
+            printf 'LAB_FIXTURE_PASSWORD=lab-only-password\n'
+            printf 'LAB_COOLDOWN_SECONDS=1209600\n'
+            printf 'LAB_RATE_LIMIT=20\n'
+            printf 'LAB_SESSION_TTL_SECONDS=3600\n'
+            printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
+            printf 'TELEGRAM_ALLOWED_USERS=%s\n' "$TELEGRAM_ALLOWED_USERS"
+          } > "$runtime_dir/lab.env"
+          echo "RUNTIME_ENV=$runtime_dir/lab.env" >> "$GITHUB_ENV"
+
+      - name: Control persistent lab containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose=(docker compose --profile telegram --env-file "$RUNTIME_ENV")
+          case "$ACTION" in
+            up)
+              "${compose[@]}" up -d --build --remove-orphans
+              ;;
+            restart)
+              "${compose[@]}" down --remove-orphans
+              "${compose[@]}" up -d --build --remove-orphans
+              ;;
+            down)
+              "${compose[@]}" down --remove-orphans
+              ;;
+            status)
+              "${compose[@]}" ps
+              ;;
+            *)
+              echo "::error::Unsupported action"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify lab health after startup
+        if: inputs.action == 'up' || inputs.action == 'restart'
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose=(docker compose --profile telegram --env-file "$RUNTIME_ENV")
+          healthy=false
+          for _ in {1..30}; do
+            if "${compose[@]}" exec -T social python -c \
+              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)" \
+              >/dev/null 2>&1; then
+              healthy=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$healthy" != true ]]; then
+            "${compose[@]}" logs --tail=100
+            exit 1
+          fi
+          "${compose[@]}" ps
+
+      - name: Remove runtime secret file
+        if: always()
+        shell: bash
+        run: rm -f "${RUNTIME_ENV:-$RUNNER_TEMP/synthetic-lab-runtime/lab.env}"
