@@ -61,7 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lab_error_handler(_: Request, exc: LabError) -> JSONResponse:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    def require_admin(x_lab_key: Annotated[str, Header(alias="X-Lab-Key")]) -> None:
+    def require_admin(x_lab_key: Annotated[str, Header(alias="X-Lab-Key")] = "") -> None:
         if not hmac.compare_digest(x_lab_key, settings.admin_key):
             raise HTTPException(status_code=403, detail="Invalid lab administration key")
 
