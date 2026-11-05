@@ -1,46 +1,51 @@
-name: synthetic-lab-controller
+name: telegram-runtime-check
 
 on:
   workflow_dispatch:
     inputs:
-      action:
-        description: Control the persistent containers on this self-hosted runner
+      minutes:
+        description: Temporary polling duration in minutes (1-330), not permanent hosting
         required: true
-        default: up
-        type: choice
-        options:
-          - up
-          - restart
-          - status
-          - down
+        default: "5"
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: synthetic-lab-controller
+  group: synthetic-telegram-polling
   cancel-in-progress: false
 
 jobs:
-  control:
-    # Deliberately self-hosted: GitHub-hosted runners are not persistent hosting.
-    runs-on: self-hosted
-    timeout-minutes: 15
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     env:
-      ACTION: ${{ inputs.action }}
+      RUN_MINUTES: ${{ inputs.minutes }}
       LAB_ADMIN_KEY: ${{ secrets.LAB_ADMIN_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_ALLOWED_USERS }}
-      COMPOSE_PROJECT_NAME: username-claim-defense-lab
+      LAB_FIXTURE_PASSWORD: lab-only-password
+      LAB_DATA_DIR: ${{ runner.temp }}/synthetic-lab-data
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate runner and secrets
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate runtime configuration
         shell: bash
         run: |
           set -euo pipefail
-          test "${{ runner.environment }}" = "self-hosted"
-          for variable in LAB_ADMIN_KEY TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS; do
+          if [[ ! "$RUN_MINUTES" =~ ^[0-9]+$ ]] || (( RUN_MINUTES < 1 || RUN_MINUTES > 330 )); then
+            echo "::error::minutes must be an integer from 1 through 330"
+            exit 1
+          fi
+          for variable in LAB_ADMIN_KEY TELEGRAM_BOT_TOKEN; do
             if [[ -z "${!variable}" ]]; then
               echo "::error::$variable must be configured in Actions secrets"
               exit 1
@@ -50,79 +55,38 @@ jobs:
               exit 1
             fi
           done
-          if [[ ! "$TELEGRAM_ALLOWED_USERS" =~ ^[0-9]+(,[[:space:]]*[0-9]+)*$ ]]; then
-            echo "::error::TELEGRAM_ALLOWED_USERS must contain comma-separated numeric IDs"
+
+      - name: Verify Telegram authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio
+          import os
+
+          from telegram import Bot
+
+          async def verify() -> None:
+              async with Bot(os.environ["TELEGRAM_BOT_TOKEN"]) as bot:
+                  identity = await bot.get_me()
+                  print(f"Telegram authentication succeeded for @{identity.username}")
+
+          asyncio.run(verify())
+          PY
+
+      - name: Run Telegram polling for the requested temporary window
+        shell: bash
+        run: |
+          set -uo pipefail
+          timeout --signal=SIGINT --kill-after=20s "${RUN_MINUTES}m" python launcher.py
+          result=$?
+          if [[ "$result" -eq 124 ]]; then
+            echo "The temporary polling window completed; the runner will now stop."
+            exit 0
+          fi
+          if [[ "$result" -eq 0 ]]; then
+            echo "::error::The bot stopped before the requested polling window ended"
             exit 1
           fi
-          docker compose version
-
-      - name: Create protected runtime environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          runtime_dir="$RUNNER_TEMP/synthetic-lab-runtime"
-          mkdir -p "$runtime_dir"
-          chmod 700 "$runtime_dir"
-          {
-            printf 'LAB_ADMIN_KEY=%s\n' "$LAB_ADMIN_KEY"
-            printf 'LAB_FIXTURE_PASSWORD=lab-only-password\n'
-            printf 'LAB_COOLDOWN_SECONDS=1209600\n'
-            printf 'LAB_RATE_LIMIT=20\n'
-            printf 'LAB_SESSION_TTL_SECONDS=3600\n'
-            printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
-            printf 'TELEGRAM_ALLOWED_USERS=%s\n' "$TELEGRAM_ALLOWED_USERS"
-          } > "$runtime_dir/lab.env"
-          echo "RUNTIME_ENV=$runtime_dir/lab.env" >> "$GITHUB_ENV"
-
-      - name: Control persistent lab containers
-        shell: bash
-        run: |
-          set -euo pipefail
-          compose=(docker compose --profile telegram --env-file "$RUNTIME_ENV")
-          case "$ACTION" in
-            up)
-              "${compose[@]}" up -d --build --remove-orphans
-              ;;
-            restart)
-              "${compose[@]}" down --remove-orphans
-              "${compose[@]}" up -d --build --remove-orphans
-              ;;
-            down)
-              "${compose[@]}" down --remove-orphans
-              ;;
-            status)
-              "${compose[@]}" ps
-              ;;
-            *)
-              echo "::error::Unsupported action"
-              exit 1
-              ;;
-          esac
-
-      - name: Verify lab health after startup
-        if: inputs.action == 'up' || inputs.action == 'restart'
-        shell: bash
-        run: |
-          set -euo pipefail
-          compose=(docker compose --profile telegram --env-file "$RUNTIME_ENV")
-          healthy=false
-          for _ in {1..30}; do
-            if "${compose[@]}" exec -T social python -c \
-              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)" \
-              >/dev/null 2>&1; then
-              healthy=true
-              break
-            fi
-            sleep 2
-          done
-          if [[ "$healthy" != true ]]; then
-            "${compose[@]}" logs --tail=100
-            exit 1
-          fi
-          "${compose[@]}" ps
-
-      - name: Remove runtime secret file
-        if: always()
-        shell: bash
-        run: rm -f "${RUNTIME_ENV:-$RUNNER_TEMP/synthetic-lab-runtime/lab.env}"
+          echo "::error::The bot exited unexpectedly with status $result"
+          exit "$result"
