@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: username-claim-defense-lab
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python launcher.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: LAB_ADMIN_KEY
+        sync: false
