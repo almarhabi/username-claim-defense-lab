@@ -1,0 +1,51 @@
+services:
+  social:
+    build: .
+    environment:
+      LAB_ADMIN_KEY: ${LAB_ADMIN_KEY:-local-lab-admin-key}
+      LAB_COOLDOWN_SECONDS: ${LAB_COOLDOWN_SECONDS:-1209600}
+      LAB_RATE_LIMIT: ${LAB_RATE_LIMIT:-20}
+    volumes:
+      - lab-data:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      lab_net:
+        aliases:
+          - social.lab.internal
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  telegram:
+    build: .
+    profiles: ["telegram"]
+    command: ["python", "-m", "bot"]
+    environment:
+      LAB_API_URL: http://social:8000
+      LAB_ADMIN_KEY: ${LAB_ADMIN_KEY:?Set LAB_ADMIN_KEY in .env}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS:?Set TELEGRAM_ALLOWED_USERS in .env}
+    depends_on:
+      social:
+        condition: service_healthy
+    networks:
+      - lab_net
+      - telegram_net
+    restart: unless-stopped
+
+volumes:
+  lab-data:
+
+networks:
+  lab_net:
+    internal: true
+  telegram_net:
