@@ -1,11 +1,10 @@
 name: Telegram lab bot 24h
 
-# Each hosted job stops before GitHub's six-hour limit. A successful long run
-# dispatches its replacement; the schedule is a fallback after an early crash.
+# A hosted job cannot run forever. It exits before GitHub's six-hour limit,
+# saves synthetic state, and dispatches one replacement. The separate watchdog
+# workflow retries after an early crash without filling the concurrency queue.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"
   push:
     branches: [main]
     paths:
@@ -13,11 +12,12 @@ on:
       - "bot/**"
       - "tests/**"
       - "launcher.py"
+      - "telegram_preflight.py"
       - "requirements.txt"
+      - "dev-requirements.txt"
+      - "pyproject.toml"
       - ".github/workflows/lab-controller.yml"
 
-# Telegram permits only one polling consumer per bot token. A replacement run
-# queues behind the current run; a code push replaces the older running version.
 concurrency:
   group: synthetic-telegram-lab
   cancel-in-progress: ${{ github.event_name == 'push' }}
@@ -36,6 +36,7 @@ jobs:
       LAB_FIXTURE_PASSWORD: lab-only-password
       LAB_DATA_DIR: .lab-data
       LAB_SESSION_TTL_SECONDS: "604800"
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -43,6 +44,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Validate runtime configuration
         shell: bash
@@ -60,25 +62,16 @@ jobs:
           done
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r dev-requirements.txt
 
-      - name: Verify Telegram authentication
-        shell: bash
+      - name: Compile and test before starting polling
         run: |
-          set -euo pipefail
-          python - <<'PY'
-          import asyncio
-          import os
+          python -m compileall -q app bot tests launcher.py telegram_preflight.py
+          ruff check app bot tests launcher.py telegram_preflight.py
+          python -m pytest
 
-          from telegram import Bot
-
-          async def verify() -> None:
-              async with Bot(os.environ["TELEGRAM_BOT_TOKEN"]) as bot:
-                  identity = await bot.get_me()
-                  print(f"Telegram authentication succeeded for @{identity.username}")
-
-          asyncio.run(verify())
-          PY
+      - name: Verify Telegram authentication and polling availability
+        run: python telegram_preflight.py
 
       - name: Prepare persistent lab directory
         run: mkdir -p .lab-data
@@ -87,7 +80,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .lab-data
-          key: lab-data-${{ github.run_id }}
+          key: lab-data-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: lab-data-
 
       - name: Run bot and lab API
@@ -97,9 +90,11 @@ jobs:
         run: |
           set -uo pipefail
           start=$(date +%s)
-          timeout --signal=SIGINT --kill-after=20s 340m python launcher.py
+          echo "Starting launcher at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          timeout --signal=SIGINT --kill-after=20s 340m python -u launcher.py
           result=$?
           elapsed=$(( $(date +%s) - start ))
+          echo "Launcher stopped with status=$result after ${elapsed}s"
 
           if [[ "$result" -eq 124 && "$elapsed" -ge 19800 ]]; then
             echo "restart=true" >> "$GITHUB_OUTPUT"
@@ -108,7 +103,7 @@ jobs:
           fi
 
           echo "::error::Bot exited before the planned restart window (status=$result, elapsed=${elapsed}s)"
-          echo "The 30-minute schedule will retry after an early failure."
+          echo "The independent watchdog will retry after an early failure."
           if [[ "$result" -eq 0 ]]; then
             exit 1
           fi
@@ -141,7 +136,7 @@ jobs:
             fi
           done <<< "$keys"
 
-      - name: Dispatch replacement run
+      - name: Dispatch exactly one replacement run
         if: steps.bot.outputs.restart == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
