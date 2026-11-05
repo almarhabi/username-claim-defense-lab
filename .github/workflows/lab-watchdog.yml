@@ -1,0 +1,36 @@
+name: Telegram lab bot watchdog
+
+on:
+  schedule:
+    - cron: "13,43 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ensure-running:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Start controller only when no run is active or queued
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_FILE: lab-controller.yml
+          BRANCH: main
+        shell: bash
+        run: |
+          set -euo pipefail
+          active=$(gh run list --workflow "$WORKFLOW_FILE" --branch "$BRANCH" \
+            --status in_progress --limit 1 --json databaseId --jq 'length')
+          queued=$(gh run list --workflow "$WORKFLOW_FILE" --branch "$BRANCH" \
+            --status queued --limit 1 --json databaseId --jq 'length')
+          waiting=$(gh run list --workflow "$WORKFLOW_FILE" --branch "$BRANCH" \
+            --status waiting --limit 1 --json databaseId --jq 'length')
+          if (( active + queued + waiting > 0 )); then
+            echo "Controller is already active or queued; no duplicate will be started."
+            exit 0
+          fi
+          echo "No live controller found; requesting a replacement run."
+          gh workflow run "$WORKFLOW_FILE" --ref "$BRANCH"
