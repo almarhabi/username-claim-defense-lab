@@ -13,6 +13,10 @@ class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any], bool, str]] = []
 
+    async def get(self, path: str, admin: bool = False) -> Any:
+        self.calls.append(("GET", path, {}, admin, ""))
+        return []
+
     async def post(
         self,
         path: str,
@@ -44,7 +48,7 @@ def make_update(user_id: int | None) -> tuple[SimpleNamespace, AsyncMock]:
 @pytest.mark.asyncio
 async def test_session_token_is_stored_but_never_sent_to_telegram() -> None:
     client = FakeClient()
-    bot = LabTelegramBot(client, {123})
+    bot = LabTelegramBot(client)
     update, reply = make_update(123)
 
     await bot.session(update, SimpleNamespace(args=["alice"]))
@@ -64,9 +68,9 @@ async def test_session_token_is_stored_but_never_sent_to_telegram() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sessions_are_isolated_between_allow_listed_users() -> None:
+async def test_sessions_are_isolated_between_telegram_users() -> None:
     client = FakeClient()
-    bot = LabTelegramBot(client, {123, 456})
+    bot = LabTelegramBot(client)
     first, _ = make_update(123)
     second, second_reply = make_update(456)
 
@@ -79,20 +83,30 @@ async def test_sessions_are_isolated_between_allow_listed_users() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unauthorized_user_cannot_call_the_lab() -> None:
+async def test_any_telegram_user_can_call_the_open_lab() -> None:
     client = FakeClient()
-    bot = LabTelegramBot(client, {123})
-    update, reply = make_update(999)
+    bot = LabTelegramBot(client)
+    update, _ = make_update(999)
+
+    await bot.names(update, SimpleNamespace())
+    assert client.calls == [("GET", "/v1/usernames", {}, False, "")]
+
+
+@pytest.mark.asyncio
+async def test_missing_telegram_user_is_rejected_without_http_request() -> None:
+    client = FakeClient()
+    bot = LabTelegramBot(client)
+    update, reply = make_update(None)
 
     await bot.names(update, SimpleNamespace())
     assert client.calls == []
-    assert "غير مصرح" in reply.await_args.args[0]
+    assert "تعذر تحديد" in reply.await_args.args[0]
 
 
 @pytest.mark.asyncio
 async def test_claim_without_session_fails_before_http_request() -> None:
     client = FakeClient()
-    bot = LabTelegramBot(client, {123})
+    bot = LabTelegramBot(client)
     update, reply = make_update(123)
 
     await bot.claim(update, SimpleNamespace(args=["lumen"]))
