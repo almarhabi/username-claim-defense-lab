@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>مختبر حماية أسماء المستخدمين</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #0b1020; color: #e7ecf7; }
+    body { max-width: 1100px; margin: auto; padding: 2rem; }
+    .badge { color: #8ee6ba; border: 1px solid #285d46; padding: .35rem .7rem; border-radius: 999px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+    section { background: #141c31; border: 1px solid #263452; border-radius: 12px; padding: 1rem; margin: 1rem 0; }
+    input, button { font: inherit; padding: .65rem; border-radius: 7px; border: 1px solid #3b4a6b; }
+    input { background: #0b1020; color: white; }
+    button { background: #4666df; color: white; cursor: pointer; }
+    pre { direction: ltr; text-align: left; white-space: pre-wrap; overflow: auto; max-height: 360px; background: #080d18; padding: 1rem; border-radius: 8px; }
+    small { color: #aebad3; }
+  </style>
+</head>
+<body>
+  <span class="badge">social.lab.internal — بيئة اصطناعية</span>
+  <h1>مختبر حماية أسماء المستخدمين</h1>
+  <p>محاكاة محلية لسباقات الالتقاط والضغط وفترات الانتظار والنقل الذري. لا توجد أي واجهة لمنصة خارجية.</p>
+
+  <div class="grid">
+    <section><h2>الحالة</h2><pre id="metrics">جارٍ التحميل…</pre></section>
+    <section><h2>الأسماء</h2><pre id="names">جارٍ التحميل…</pre></section>
+  </div>
+
+  <section>
+    <h2>تشغيل تجربة</h2>
+    <p><small>مفتاح المختبر الافتراضي للتشغيل المحلي: local-lab-admin-key. غيّره عند مشاركة الجهاز.</small></p>
+    <input id="key" type="password" value="local-lab-admin-key" aria-label="مفتاح المختبر">
+    <input id="name" value="rare" aria-label="اسم وهمي">
+    <input id="count" type="number" min="2" max="16" value="8" aria-label="عدد المتنافسين">
+    <button onclick="runRace()">سباق التقاط</button>
+    <button onclick="runBurst()">ضغط 50 طلباً</button>
+    <button onclick="resetLab()">إعادة الضبط</button>
+    <pre id="result">لم تُشغّل تجربة بعد.</pre>
+  </section>
+
+<script>
+const show = (id, value) => document.getElementById(id).textContent = JSON.stringify(value, null, 2);
+async function request(path, options = {}) {
+  const response = await fetch(path, options);
+  const body = await response.json();
+  if (!response.ok) throw new Error(JSON.stringify(body));
+  return body;
+}
+async function refresh() {
+  try {
+    show('metrics', await request('/v1/lab/metrics'));
+    show('names', await request('/v1/usernames'));
+  } catch (error) { show('result', { error: error.message }); }
+}
+function adminOptions(body) {
+  return { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Lab-Key': document.getElementById('key').value }, body: JSON.stringify(body) };
+}
+async function execute(path, body) {
+  try { show('result', await request(path, adminOptions(body))); await refresh(); }
+  catch (error) { show('result', { error: error.message }); }
+}
+function runRace() { execute('/v1/lab/race', { name: document.getElementById('name').value, contenders: Number(document.getElementById('count').value) }); }
+function runBurst() { execute('/v1/lab/burst', { account: 'alice', requests: 50, name: 'burst' }); }
+function resetLab() { execute('/v1/lab/reset', {}); }
+refresh();
+</script>
+</body>
+</html>
