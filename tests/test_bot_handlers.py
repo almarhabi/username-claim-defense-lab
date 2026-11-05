@@ -83,6 +83,37 @@ async def test_sessions_are_isolated_between_telegram_users() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sessions_survive_controller_restart(tmp_path) -> None:
+    state_path = tmp_path / "telegram-sessions.json"
+    first = LabTelegramBot(FakeClient(), state_path=state_path)
+    update, _ = make_update(123)
+    await first.session(update, SimpleNamespace(args=["alice"]))
+
+    restored_client = FakeClient()
+    restored = LabTelegramBot(restored_client, state_path=state_path)
+    await restored.claim(update, SimpleNamespace(args=["lumen"]))
+
+    assert restored_client.calls[-1] == (
+        "POST",
+        "/v1/usernames/lumen/claim",
+        {},
+        False,
+        "synthetic-secret-token",
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_saved_session_state_is_ignored(tmp_path) -> None:
+    state_path = tmp_path / "telegram-sessions.json"
+    state_path.write_text("not-json", encoding="utf-8")
+    bot = LabTelegramBot(FakeClient(), state_path=state_path)
+    update, reply = make_update(123)
+
+    await bot.whoami(update, SimpleNamespace())
+    assert '"synthetic_session": false' in reply.await_args.args[0]
+
+
+@pytest.mark.asyncio
 async def test_any_telegram_user_can_call_the_open_lab() -> None:
     client = FakeClient()
     bot = LabTelegramBot(client)
